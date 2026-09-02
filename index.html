@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>光之子 vs 冥龙 —— WJL 的云端守护战（三关版）</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(160deg, #1b2233, #0d1020);
+    font-family: 'Microsoft YaHei', sans-serif;
+  }
+  canvas { border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,.55); }
+</style>
+</head>
+<body>
+<canvas id="game" width="600" height="600"></canvas>
+<script>
+"use strict";
+/* =================================================================================
+ * 《光·遇》主题坦克大战 —— 「光之子 vs 冥龙」 三关版（HTML/Canvas 移植版）
+ * 学校附加题作业 | 原创标识：WJL（地图中央金色石柱拼字）
+ *
+ * 操作方式：
+ *   ↑↓←→ 或 WASD   移动光之子
+ *   空格 / J        发射金色光波
+ *   R               游戏结束 / 通关后 重新开始
+ * ================================================================================ */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+/* ----------------------------- 基础常量 --------------------------------------- */
+const TILE = 30, COLS = 20, ROWS = 20;
+const WIDTH = COLS * TILE, HEIGHT = ROWS * TILE;   // 600 x 600
+
+const C_SKY_TOP = [135, 206, 250], C_SKY_BOTTOM = [230, 245, 255];
+const CLOUD_GRAY = "rgb(235,240,245)", CLOUD_EDGE = "rgb(200,210,220)";
+const STONE_DARK = "rgb(70,60,90)", STONE_EDGE = "rgb(100,90,130)";
+const GOLD = "rgb(255,215,80)", GOLD_EDGE = "rgb(200,160,30)";
+const WHITE = "rgb(255,255,255)", CAPE_COLOR = "rgb(255,140,90)";
+const KRILL_BODY = "rgb(25,20,35)", KRILL_EYE = "rgb(180,40,40)";
+const LIGHT_WAVE = "rgb(255,225,100)";
+
+const T = {
+  win:   "星光汇聚，云野重归光明！",
+  lose:  "翼之光熄灭了……",
+  base:  "祭坛陷落，星光消逝……",
+  hint:  "WASD/方向键移动 | 空格/J发射 | R重开 | ESC退出",
+  clear: "关卡通关！",
+  next:  "即将进入下一关……",
+  final: "最终决战：击败大冥龙！",
+  level: "第 {} 关",
+};
+const fmtLevel = n => T.level.replace("{}", n);
+
+/* ----------------------------- 工具函数 --------------------------------------- */
+function randInt(a, b) { return Math.floor(Math.random() * (b - a + 1)) + a; }
+function choice(arr) { return arr[randInt(0, arr.length - 1)]; }
+function rgb(c) { return `rgb(${c[0]},${c[1]},${c[2]})`; }
+function overlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+/* 与 Python random.seed(42) 等效的可复现随机源（仅用于地图生成） */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ----------------------------- 绘图辅助 --------------------------------------- */
+function rr(x, y, w, h, r) {          // 圆角矩形路径
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function ell(x, y, w, h) {            // 等效 pygame.draw.ellipse（外接矩形）
+  ctx.beginPath();
+  ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+function circ(x, y, r, fill = true) {
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+  fill ? ctx.fill() : ctx.stroke();
+}
+function line(x1, y1, x2, y2) {
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
+function poly(pts) {
+  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath(); ctx.fill();
+}
+function text(str, x, y, size, color, align = "left", baseline = "top") {
+  ctx.font = size + "px 'Microsoft YaHei','SimHei',sans-serif";
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = baseline;
+  ctx.fillText(str, x, y);
+}
+
+/* ----------------------------- WJL 字母点阵 ------------------------------------ */
+const LETTER_PATTERNS = {
+  "W": ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
+  "J": ["01110", "00100", "00100", "00100", "00100", "10100", "01100"],
+  "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+};
+
+function buildMap() {
+  /* 生成障碍物：中央金色 WJL + 随机云层(可破坏) + 石门(不可破坏) + 祭坛 */
+  const walls = [];
+  const startCol = 2, startRow = 6, gap = 1;
+  "WJL".split("").forEach((letter, i) => {
+    const pattern = LETTER_PATTERNS[letter];
+    const colOffset = startCol + i * (5 + gap);
+    pattern.forEach((ln, r) => {
+      for (let c = 0; c < ln.length; c++) {
+        if (ln[c] === "1") {
+          walls.push({ x: (colOffset + c) * TILE, y: (startRow + r) * TILE,
+                       w: TILE, h: TILE, kind: "gold" });
+        }
+      }
+    });
+  });
+  const protectedRects = [
+    { x: 2 * TILE, y: 16 * TILE, w: TILE * 3, h: TILE * 3 },
+    { x: 8 * TILE, y: 17 * TILE, w: TILE * 3, h: TILE * 3 },
+  ];
+  const rng = mulberry32(42);           // 每关地图相同（与原版一致）
+  const rInt = (a, b) => Math.floor(rng() * (b - a + 1)) + a;
+  const tryAdd = (kind, count) => {
+    for (let i = 0; i < count; i++) {
+      const x = rInt(0, COLS - 1) * TILE, y = rInt(0, ROWS - 1) * TILE;
+      const rect = { x, y, w: TILE, h: TILE };
+      const inLetterZone = y / TILE >= 4 && y / TILE <= 14;
+      if (!walls.some(w => overlap(rect, w)) && !inLetterZone &&
+          !protectedRects.some(p => overlap(rect, p))) {
+        walls.push({ x, y, w: TILE, h: TILE, kind });
+      }
+    }
+  };
+  tryAdd("cloud", 45);
+  tryAdd("stone", 12);
+  const base = { x: 9 * TILE, y: 18 * TILE, w: TILE * 2, h: TILE * 2 };
+  return { walls, base };
+}
+
+/* ----------------------------- 游戏状态 --------------------------------------- */
+const SPAWN = [3.5 * TILE, 17.5 * TILE];     // 玩家出生点
+let game, S;
+
+function newGame() { return { level: 1, lives: 3 }; }
+
+function makeEnemy(x, y, isKrill, speed, fireRng, chase = true) {
+  /* 生成敌人：全部追踪光之子；path/path_timer 用于 BFS 寻路 */
+  return {
+    x, y, dir: choice([[1, 0], [-1, 0], [0, 1], [0, -1]]),
+    kind: isKrill ? "krill" : "crab", speed,
+    wander_turn: randInt(30, 90),        // 无敌期游走计时
+    fire: randInt(fireRng[0], fireRng[1]), fire_rng: fireRng,
+    chase, path: [], path_timer: randInt(0, 30),
+    jitter: null,                        // 每格随机代价，让每个敌人路线不同
+  };
+}
+
+function startLevel(g) {
+  /* 根据关卡数生成该关的完整状态 */
+  const { walls, base } = buildMap();
+  const lvl = g.level;
+  const st = {
+    walls, base, base_alive: true,
+    player: [SPAWN[0], SPAWN[1]], pdir: [0, -1], invincible: 0,
+    enemies: [], boss: null, bullets: [], crab_timer: 0,
+    flash_timer: 0, shake: 0,
+    state: "playing", state_timer: 0, lose_reason: "", bonus: 0,
+  };
+  if (lvl === 1) {          // 第1关：3 只慢速追踪敌人
+    const spots = [[1.5, 1.5], [10, 1.5], [18, 1.5]];
+    spots.forEach((s, i) =>
+      st.enemies.push(makeEnemy(s[0] * TILE, s[1] * TILE, i % 2 === 0, 1.0, [140, 260])));
+  } else if (lvl === 2) {   // 第2关：5 只快速追踪敌人
+    const spots = [[1.5, 1.5], [10, 1.5], [18, 1.5], [4.5, 2.5], [15, 2.5]];
+    spots.forEach((s, i) =>
+      st.enemies.push(makeEnemy(s[0] * TILE, s[1] * TILE, i % 2 === 0, 1.6, [80, 180])));
+  } else {                  // 第3关：大冥龙 Boss + 追踪螃蟹
+    const hp = randInt(10, 20);          // 随机 10~20 次打击死亡
+    st.boss = {
+      x: 10 * TILE, y: 2.5 * TILE, hp, max_hp: hp,
+      dir: choice([[1, 0], [-1, 0]]), speed: 1.2, turn: 0,
+      attack_timer: 150, mode: 0,
+    };
+    st.crab_timer = 180;
+  }
+  return st;
+}
+
+game = newGame();
+S = startLevel(game);
+
+/* ----------------------------- 碰撞与移动 ------------------------------------- */
+function blocked(x, y, radius) {
+  const r = { x: x - radius, y: y - radius, w: radius * 2, h: radius * 2 };
+  for (const w of S.walls) if (overlap(r, w)) return true;
+  if (S.base_alive && overlap(r, S.base)) return true;
+  return x < radius || x > WIDTH - radius || y < radius || y > HEIGHT - radius;
+}
+
+function moveUnit(u, dx, dy, speed, radius) {
+  /* 分轴移动 + 返回是否被挡（用于换方向，防止卡住） */
+  let hit = false;
+  const nx = u.x + dx * speed;
+  if (!blocked(nx, u.y, radius)) u.x = nx; else hit = true;
+  const ny = u.y + dy * speed;
+  if (!blocked(u.x, ny, radius)) u.y = ny; else hit = true;
+  return hit;
+}
+
+/* ---------- BFS 寻路：绕过墙找到通往光之子的下一步 ---------- */
+function walkableGrid() {
+  const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(true));
+  for (const w of S.walls) grid[Math.floor(w.y / TILE)][Math.floor(w.x / TILE)] = false;
+  if (S.base_alive) {
+    for (let r = Math.floor(S.base.y / TILE); r < Math.floor((S.base.y + S.base.h) / TILE); r++)
+      for (let c = Math.floor(S.base.x / TILE); c < Math.floor((S.base.x + S.base.w) / TILE); c++)
+        if (r >= 0 && r < ROWS && c >= 0 && c < COLS) grid[r][c] = false;
+  }
+  return grid;
+}
+
+function findPath(e, tx, ty) {
+  /* BFS 寻路 + 每格随机代价（jitter）：不同敌人绕墙路线不同。
+     返回下一步方向 [dx, dy]；找不到路返回 null。 */
+  const grid = walkableGrid();
+  const sc = Math.floor(e.x / TILE), sr = Math.floor(e.y / TILE);
+  const tc = Math.floor(tx / TILE), tr = Math.floor(ty / TILE);
+  if (!(sc >= 0 && sc < COLS && sr >= 0 && sr < ROWS)) return null;
+  /* 玩家所在格不可走（贴着祭坛）时，退化为直线方向 */
+  if (!(tc >= 0 && tc < COLS && tr >= 0 && tr < ROWS) || !grid[tr][tc]) {
+    return Math.abs(tx - e.x) > Math.abs(ty - e.y)
+      ? [tx > e.x ? 1 : -1, 0] : [0, ty > e.y ? 1 : -1];
+  }
+  /* 随机更新本敌人的"路径偏好" */
+  if (!e.jitter || Math.random() < 0.02) {
+    e.jitter = Array.from({ length: ROWS },
+      () => Array.from({ length: COLS }, () => Math.random()));
+  }
+  const key = (r, c) => r + "," + c;
+  const dist = {}, prev = {};
+  dist[key(sr, sc)] = 0; prev[key(sr, sc)] = null;
+  const dq = [[sr, sc]];
+  while (dq.length) {
+    const [r, c] = dq.shift();
+    if (r === tr && c === tc) break;
+    for (const [dr, dc] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) {
+      const nr = r + dr, nc = c + dc, k = key(nr, nc);
+      if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS && grid[nr][nc] &&
+          dist[k] === undefined) {
+        /* 代价 = 上一步 + 1 + 随机抖动 -> 同距离下偏好随机 */
+        dist[k] = dist[key(r, c)] + 1 + e.jitter[nr][nc];
+        prev[k] = [r, c];
+        dq.push([nr, nc]);
+      }
+    }
+  }
+  if (prev[key(tr, tc)] === undefined) return null;
+  let cur = [tr, tc];                      // 回溯到第一步
+  while (prev[key(cur[0], cur[1])] &&
+         !(prev[key(cur[0], cur[1])][0] === sr && prev[key(cur[0], cur[1])][1] === sc)) {
+    cur = prev[key(cur[0], cur[1])];
+  }
+  if (prev[key(cur[0], cur[1])] === null) return null;
+  return [cur[1] - sc, cur[0] - sr];
+}
+
+/* ----------------------------- 战斗逻辑 --------------------------------------- */
+function fire(x, y, dx, dy, owner, speed = 6) {
+  S.bullets.push([x + dx * 16, y + dy * 16, dx, dy, owner, speed]);
+}
+
+function hurtPlayer(reason) {
+  /* 光之子受击：扣 1 条命；命用完了才真正游戏结束 */
+  if (S.invincible > 0 || S.state !== "playing") return;
+  game.lives -= 1;
+  S.flash_timer = 45; S.shake = 20;
+  if (game.lives <= 0) {
+    S.state = "over"; S.lose_reason = reason;
+  } else {
+    S.player = [SPAWN[0], SPAWN[1]];     // 回出生点复活
+    S.invincible = 60;                   // 1 秒无敌
+  }
+}
+
+function addLifeReward() {
+  /* 过关奖励：随机 +1~5 条命，可叠加 */
+  const bonus = randInt(1, 5);
+  game.lives += bonus;
+  return bonus;
+}
+
+/* ----------------------------- 输入 ------------------------------------------- */
+const keys = new Set();
+window.addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  if (["arrowup", "arrowdown", "arrowleft", "arrowright", " "].includes(k)) e.preventDefault();
+  keys.add(k);
+  if (e.repeat) return;
+  /* ★ 无敌期无法开火 */
+  if ((k === " " || k === "j") && S.state === "playing" && S.invincible <= 0) {
+    fire(S.player[0], S.player[1], S.pdir[0], S.pdir[1], "p");
+  }
+  /* ★ R 键：分出胜负后随时可重开 */
+  if (k === "r" && (S.state === "over" || S.state === "win")) {
+    game = newGame(); S = startLevel(game);
+  }
+});
+window.addEventListener("keyup", e => keys.delete(e.key.toLowerCase()));
+window.addEventListener("blur", () => keys.clear());
+
+/* ----------------------------- 更新（每帧逻辑） -------------------------------- */
+function update() {
+  /* ---- 玩家移动（WASD + 方向键 都支持） ---- */
+  if (S.state === "playing") {
+    let move = null;
+    if (keys.has("arrowup") || keys.has("w")) move = [0, -1];
+    else if (keys.has("arrowdown") || keys.has("s")) move = [0, 1];
+    else if (keys.has("arrowleft") || keys.has("a")) move = [-1, 0];
+    else if (keys.has("arrowright") || keys.has("d")) move = [1, 0];
+    if (move) {
+      S.pdir = move;
+      const p = { x: S.player[0], y: S.player[1] };
+      moveUnit(p, move[0], move[1], 2.6, 12);
+      S.player = [p.x, p.y];
+    }
+    if (S.invincible > 0) S.invincible -= 1;
+  }
+
+  /* ---- 敌人 AI：BFS 寻路追踪光之子（每个敌人路线不同） ---- */
+  if (S.state === "playing") {
+    const px = S.player[0], py = S.player[1];
+    for (const e of S.enemies.slice()) {
+      if (S.invincible > 0) {
+        /* ★ 复活无敌期：敌人失去锁定，原地随机游走，不开火 */
+        e.wander_turn -= 1;
+        if (e.wander_turn <= 0) {
+          e.dir = choice([[1, 0], [-1, 0], [0, 1], [0, -1]]);
+          e.wander_turn = randInt(30, 90);
+        }
+        const d = e.dir;
+        if (moveUnit(e, d[0], d[1], e.speed, 13)) {
+          e.dir = choice([[1, 0], [-1, 0], [0, 1], [0, -1]]);
+        }
+        e.path = [];
+        continue;
+      }
+      /* ★ 每 0.5 秒重新寻路一次，绕过墙追踪光之子 */
+      e.path_timer -= 1;
+      if (e.path_timer <= 0 || !e.path.length) {
+        const step = findPath(e, px, py);
+        if (step) { e.dir = step; e.path = [step]; }
+        e.path_timer = 30;
+      }
+      const d = e.dir;
+      if (moveUnit(e, d[0], d[1], e.speed, 13)) e.path_timer = 0;  // 撞墙立即重新寻路
+      /* 开火：朝光之子所在的大致方向射 */
+      e.fire -= 1;
+      if (e.fire <= 0) {
+        let fd;
+        if (Math.abs(px - e.x) > Math.abs(py - e.y)) fd = [px > e.x ? 1 : -1, 0];
+        else fd = [0, py > e.y ? 1 : -1];
+        fire(e.x, e.y, fd[0], fd[1], "e", 4);
+        e.fire = randInt(e.fire_rng[0], e.fire_rng[1]);
+      }
+      /* 碰到光之子 */
+      if (Math.abs(e.x - px) < 22 && Math.abs(e.y - py) < 22) hurtPlayer("hit");
+    }
+  }
+
+  /* ---- 第3关：Boss 大冥龙 AI ---- */
+  if (S.state === "playing" && S.boss && S.boss.hp > 0) {
+    const b = S.boss, px = S.player[0], py = S.player[1];
+    /* ★ Boss 在空中飞行，无视一切墙体，直接朝光之子漂移 ★ */
+    b.x = Math.max(40, Math.min(WIDTH - 40, b.x + (px > b.x ? 0.4 : -0.4)));
+    b.y = Math.max(50, Math.min(HEIGHT - 40, b.y + (py > b.y ? 0.4 : -0.4)));
+    if (Math.abs(b.x - px) < 40 && Math.abs(b.y - py) < 40) hurtPlayer("hit");
+    /* ★ Boss 三种攻击方式，循环轮换；无敌期不攻击 ★ */
+    if (S.invincible > 0) b.attack_timer = Math.max(b.attack_timer, 30);
+    else b.attack_timer -= 1;
+    if (S.invincible <= 0 && b.attack_timer <= 0) {
+      const ang = Math.atan2(py - b.y, px - b.x);
+      if (b.mode === 0) {            // 攻击一：环形散射 12 枚黑暗弹
+        for (let k = 0; k < 12; k++) {
+          const a = k * Math.PI / 6;
+          fire(b.x, b.y, Math.cos(a), Math.sin(a), "e", 3.5);
+        }
+      } else if (b.mode === 1) {     // 攻击二：瞄准光之子的扇形 5 连发
+        for (let k = -2; k <= 2; k++) {
+          const a = ang + k * 0.18;
+          fire(b.x, b.y, Math.cos(a), Math.sin(a), "e", 4.5);
+        }
+      } else {                       // 攻击三：追踪直射 3 连发（速度错开）
+        for (let k = 0; k < 3; k++) {
+          fire(b.x, b.y, Math.cos(ang), Math.sin(ang), "e", 3 + k);
+        }
+      }
+      b.mode = (b.mode + 1) % 3;
+      b.attack_timer = randInt(140, 220);
+    }
+  }
+
+  /* ---- 第3关：持续刷新追踪螃蟹 ---- */
+  if (S.state === "playing" && game.level === 3) {
+    S.crab_timer -= 1;
+    const crabs = S.enemies.filter(e => e.chase);
+    if (S.crab_timer <= 0 && crabs.length < 4) {
+      const cx = choice([2, 6, 10, 14, 18]) * TILE;
+      S.enemies.push(makeEnemy(cx, 1.5 * TILE, false, 1.8, [150, 300], true));
+      S.crab_timer = randInt(240, 420);        // 4~7 秒一只
+    }
+  }
+
+  /* ---- 子弹运动与碰撞 ---- */
+  const newBullets = [];
+  for (const bl of S.bullets) {
+    bl[0] += bl[2] * bl[5];
+    bl[1] += bl[3] * bl[5];
+    let hit = false;
+    const br = { x: bl[0] - 4, y: bl[1] - 4, w: 8, h: 8 };
+    if (bl[0] < 0 || bl[0] > WIDTH || bl[1] < 0 || bl[1] > HEIGHT) hit = true;
+    if (!hit) {
+      for (const w of S.walls.slice()) {
+        if (overlap(br, w)) {
+          hit = true;
+          if (w.kind === "cloud") S.walls.splice(S.walls.indexOf(w), 1);
+          break;
+        }
+      }
+    }
+    if (!hit && S.base_alive && overlap(br, S.base)) {
+      S.base_alive = false; S.state = "over";
+      S.lose_reason = "base"; S.flash_timer = 45; hit = true;
+    }
+    /* 玩家光波命中 */
+    if (!hit && bl[4] === "p") {
+      for (const e of S.enemies.slice()) {
+        if (Math.abs(e.x - bl[0]) < 16 && Math.abs(e.y - bl[1]) < 16) {
+          S.enemies.splice(S.enemies.indexOf(e), 1); hit = true; break;
+        }
+      }
+      /* 打 Boss：20% 概率暴击（一次算 2 下） */
+      if (!hit && S.boss && S.boss.hp > 0 &&
+          Math.abs(S.boss.x - bl[0]) < 38 && Math.abs(S.boss.y - bl[1]) < 28) {
+        const dmg = Math.random() < 0.2 ? 2 : 1;
+        S.boss.hp -= dmg; S.shake = 8; hit = true;
+        if (S.boss.hp <= 0) S.flash_timer = 60;
+      }
+    }
+    /* 敌方子弹打玩家 */
+    if (!hit && bl[4] === "e" && S.state === "playing" && S.invincible <= 0) {
+      if (Math.abs(S.player[0] - bl[0]) < 14 && Math.abs(S.player[1] - bl[1]) < 14) {
+        hurtPlayer("hit"); hit = true;
+      }
+    }
+    if (!hit) newBullets.push(bl);
+  }
+  S.bullets = newBullets;
+
+  /* ---- 过关判定 ---- */
+  if (S.state === "playing") {
+    const bossDead = (S.boss === null || S.boss.hp <= 0);
+    if (game.level < 3) {
+      if (!S.enemies.length) {
+        const bonus = addLifeReward();
+        S.state = "levelclear"; S.state_timer = 150; S.bonus = bonus;
+      }
+    } else {
+      if (bossDead) { S.state = "win"; S.flash_timer = 60; }
+    }
+  }
+  /* 过关倒计时 -> 进入下一关 */
+  if (S.state === "levelclear") {
+    S.state_timer -= 1;
+    if (S.state_timer <= 0) {
+      game.level += 1;
+      S = startLevel(game);
+    }
+  }
+
+  /* 受击/死亡闪烁 + 屏幕震动计时 */
+  if (S.flash_timer > 0) S.flash_timer -= 1;
+  if (S.shake > 0) S.shake -= 1;
+}
+
+/* ----------------------------- 绘制 ------------------------------------------- */
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, HEIGHT);
+  g.addColorStop(0, rgb(C_SKY_TOP)); g.addColorStop(1, rgb(C_SKY_BOTTOM));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  ctx.fillStyle = "rgb(245,250,255)";
+  for (const [cx, cy, s] of [[80, 60, 1.0], [450, 90, 1.3], [250, 40, 0.8],
+                             [540, 180, 0.9], [120, 200, 1.1]]) {
+    ell(cx, cy, 70 * s, 28 * s);
+    ell(cx + 20 * s, cy - 10 * s, 45 * s, 24 * s);
+  }
+}
+
+function drawWall(w) {
+  if (w.kind === "cloud") {
+    ctx.fillStyle = CLOUD_GRAY; rr(w.x, w.y, w.w, w.h, 8); ctx.fill();
+    ctx.fillStyle = CLOUD_EDGE;
+    circ(w.x, w.y + w.h / 2, 6); circ(w.x + w.w, w.y + w.h / 2, 6);
+    ctx.fillStyle = WHITE; circ(w.x + w.w / 2, w.y + 7, 7);
+  } else if (w.kind === "stone") {
+    ctx.fillStyle = STONE_DARK; ctx.fillRect(w.x, w.y, w.w, w.h);
+    ctx.strokeStyle = STONE_EDGE; ctx.lineWidth = 2;
+    ctx.strokeRect(w.x + 1, w.y + 1, w.w - 2, w.h - 2);
+    line(w.x + w.w / 2, w.y, w.x + w.w / 2, w.y + w.h);
+  } else if (w.kind === "gold") {
+    ctx.fillStyle = GOLD; rr(w.x, w.y, w.w, w.h, 4); ctx.fill();
+    ctx.strokeStyle = GOLD_EDGE; ctx.lineWidth = 2; rr(w.x, w.y, w.w, w.h, 4); ctx.stroke();
+    ctx.fillStyle = "rgb(255,245,180)"; circ(w.x + w.w / 2, w.y + w.h / 2, 4);
+  }
+}
+
+function drawBase(destroyed) {
+  const b = S.base;
+  if (destroyed) {
+    ctx.fillStyle = "rgb(60,60,70)"; rr(b.x, b.y, b.w, b.h, 6); ctx.fill();
+    ctx.strokeStyle = "rgb(40,40,50)"; ctx.lineWidth = 3;
+    line(b.x, b.y, b.x + b.w, b.y + b.h);
+    return;
+  }
+  ctx.fillStyle = "rgb(120,110,160)"; rr(b.x, b.y, b.w, b.h, 6); ctx.fill();
+  ctx.strokeStyle = "rgb(90,80,130)"; ctx.lineWidth = 3; rr(b.x, b.y, b.w, b.h, 6); ctx.stroke();
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgb(255,240,200)"; circ(cx, cy, 22, false);
+  ctx.strokeStyle = "rgb(255,210,120)"; circ(cx, cy, 15, false);
+  ctx.strokeStyle = "rgb(255,180,60)"; circ(cx, cy, 8, false);
+  ctx.fillStyle = WHITE; circ(cx, cy, 4);
+}
+
+function drawPlayer() {
+  /* 光之子：白圆身体 + 橙色斗篷 + 光环；无敌时半透明闪烁 */
+  const cx = Math.round(S.player[0]), cy = Math.round(S.player[1]);
+  if (S.invincible > 0 && Math.floor(S.invincible / 5) % 2 === 0) return;  // 闪烁半隐
+  const dx = S.pdir[0], dy = S.pdir[1];
+  const bx = cx - dx * 14, by = cy - dy * 14;
+  const qx = -dy * 10, qy = dx * 10;
+  ctx.fillStyle = CAPE_COLOR;
+  poly([[cx + dx * 2, cy + dy * 2], [bx + qx, by + qy], [bx - qx, by - qy]]);
+  ctx.fillStyle = "rgb(255,250,235)"; circ(cx, cy, 11);
+  ctx.strokeStyle = WHITE; ctx.lineWidth = 2; circ(cx, cy, 11, false);
+  ctx.strokeStyle = GOLD; circ(cx, cy - 14, 5, false);
+  ctx.fillStyle = LIGHT_WAVE; circ(cx + dx * 14, cy + dy * 14, 4);
+}
+
+function drawEnemy(e) {
+  const cx = Math.round(e.x), cy = Math.round(e.y);
+  if (e.kind === "krill") {          // 普通冥龙
+    ctx.fillStyle = KRILL_BODY;
+    ell(cx - 14, cy - 9, 28, 18);
+    poly([[cx, cy], [cx - 18, cy - 16], [cx - 10, cy]]);
+    poly([[cx, cy], [cx + 18, cy - 16], [cx + 10, cy]]);
+    ctx.fillStyle = KRILL_EYE;
+    circ(cx + 8, cy - 3, 3); circ(cx + 8, cy + 3, 3);
+  } else {                           // 黑螃蟹
+    ctx.fillStyle = "rgb(30,25,40)"; circ(cx, cy, 11);
+    ctx.strokeStyle = KRILL_BODY; ctx.lineWidth = 2;
+    for (let k = 0; k < 3; k++) {
+      const lx = cx - 12 + k * 12;
+      line(lx, cy - 8, lx - 4, cy - 16);
+      line(lx, cy + 8, lx - 4, cy + 16);
+    }
+    ctx.fillStyle = KRILL_BODY;
+    circ(cx - 12, cy, 4); circ(cx + 12, cy, 4);
+    ctx.fillStyle = KRILL_EYE;
+    circ(cx - 3, cy - 4, 2); circ(cx + 3, cy - 4, 2);
+  }
+}
+
+function drawBoss() {
+  /* 大冥龙 Boss：巨型黑龙 + 翅膀 + 红眼，头顶显示血条 */
+  const b = S.boss;
+  const cx = Math.round(b.x), cy = Math.round(b.y);
+  ctx.fillStyle = "rgb(15,10,25)";
+  poly([[cx, cy], [cx - 46, cy - 34], [cx - 22, cy]]);
+  poly([[cx, cy], [cx + 46, cy - 34], [cx + 22, cy]]);
+  ctx.fillStyle = KRILL_BODY;
+  ell(cx - 34, cy - 20, 68, 40);
+  ctx.strokeStyle = "rgb(50,40,70)"; ctx.lineWidth = 2;
+  for (let k = 0; k < 3; k++) {
+    ctx.beginPath();
+    ctx.ellipse(cx - 34 + k * 18 + 12, cy, 12, 20, 0, 0, Math.PI, true);
+    ctx.stroke();
+  }
+  ctx.fillStyle = KRILL_EYE;
+  circ(cx + 20, cy - 7, 6); circ(cx + 20, cy + 7, 6);
+  ctx.fillStyle = "rgb(255,120,120)";
+  circ(cx + 22, cy - 8, 2); circ(cx + 22, cy + 6, 2);
+  /* ---- Boss 血条（头顶） ---- */
+  const barW = 80, barH = 8, bx = cx - barW / 2, by = cy - 42;
+  ctx.fillStyle = "rgb(60,50,70)"; ctx.fillRect(bx, by, barW, barH);
+  const ratio = Math.max(0, b.hp / b.max_hp);
+  ctx.fillStyle = ratio < 0.3 ? "rgb(255,80,80)" :
+                  ratio < 0.6 ? "rgb(255,170,60)" : "rgb(120,220,120)";
+  ctx.fillRect(bx, by, barW * ratio, barH);
+  ctx.strokeStyle = WHITE; ctx.lineWidth = 1;
+  ctx.strokeRect(bx + 0.5, by + 0.5, barW - 1, barH - 1);
+  text("大冥龙 " + b.hp + "/" + b.max_hp, cx, by - 18, 20, "rgb(120,40,40)", "center");
+}
+
+function drawBullet(x, y) {
+  ctx.fillStyle = "rgb(255,245,180)"; circ(x, y, 7);
+  ctx.fillStyle = LIGHT_WAVE; circ(x, y, 4);
+}
+
+function drawLives(x, y) {
+  /* 左上角画小爱心表示命数 */
+  ctx.fillStyle = "rgb(255,100,130)";
+  for (let i = 0; i < game.lives; i++) {
+    const cx = x + i * 22, cy = y;
+    circ(cx - 4, cy - 2, 5); circ(cx + 4, cy - 2, 5);
+    poly([[cx - 9, cy], [cx + 9, cy], [cx, cy + 10]]);
+  }
+}
+
+function render() {
+  ctx.save();
+  if (S.shake > 0) ctx.translate(randInt(-3, 3), randInt(-3, 3));   // 屏幕震动（仅世界层）
+
+  drawSky();
+  for (const w of S.walls) drawWall(w);
+  drawBase(!S.base_alive);
+  for (const e of S.enemies) drawEnemy(e);
+  if (S.boss && S.boss.hp > 0) drawBoss();
+  drawPlayer();
+  for (const bl of S.bullets) {
+    if (bl[4] === "p") drawBullet(bl[0], bl[1]);
+    else { ctx.fillStyle = "rgb(90,40,120)"; circ(bl[0], bl[1], 5); }
+  }
+
+  /* ---- 受击/死亡闪烁特效 ---- */
+  if (S.flash_timer > 0 && Math.floor(S.flash_timer / 6) % 2 === 0) {
+    ctx.globalAlpha = 120 / 255;
+    ctx.fillStyle = S.flash_timer > 20 ? WHITE : "rgb(20,15,30)";
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+
+  /* ---- HUD（不随震动） ---- */
+  text(T.hint, 10, HEIGHT - 24, 20, "rgb(90,100,130)");
+  text(fmtLevel(game.level) + "  |  WJL", 10, 4, 20, "rgb(90,100,130)");
+  drawLives(24, 44);
+  if (game.level === 3) text(T.final, WIDTH - 10, 4, 20, "rgb(180,60,60)", "right");
+
+  /* ---- 结算 / 过场 ---- */
+  if (S.state === "over" || S.state === "win" || S.state === "levelclear") {
+    ctx.globalAlpha = 170 / 255;
+    ctx.fillStyle = S.state === "win" ? "rgb(255,250,235)" :
+                    S.state === "levelclear" ? "rgb(230,245,255)" : "rgb(25,20,35)";
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.globalAlpha = 1;
+    if (S.state === "win") {
+      text(T.win, WIDTH / 2, HEIGHT / 2, 44, "rgb(200,150,30)", "center", "middle");
+      text("按 R 重新开始", WIDTH / 2, HEIGHT / 2 + 60, 28, "rgb(150,150,170)", "center", "middle");
+    } else if (S.state === "levelclear") {
+      text(T.clear, WIDTH / 2, HEIGHT / 2, 44, "rgb(80,140,200)", "center", "middle");
+      text("星光祝福：生命 +" + S.bonus + "！", WIDTH / 2, HEIGHT / 2 + 50, 28,
+           "rgb(200,120,60)", "center", "middle");
+      text(T.next, WIDTH / 2, HEIGHT / 2 + 90, 28, "rgb(120,130,160)", "center", "middle");
+    } else {
+      const reason = S.lose_reason === "base" ? T.base : T.lose;
+      text(reason, WIDTH / 2, HEIGHT / 2, 44, "rgb(255,200,120)", "center", "middle");
+      text("按 R 重新开始", WIDTH / 2, HEIGHT / 2 + 60, 28, "rgb(150,150,170)", "center", "middle");
+    }
+  }
+}
+
+/* ----------------------------- 主循环（固定 60 帧） ---------------------------- */
+let last = performance.now(), acc = 0;
+const STEP = 1000 / 60;
+function loop(now) {
+  acc += Math.min(now - last, 250); last = now;
+  while (acc >= STEP) { update(); acc -= STEP; }
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
